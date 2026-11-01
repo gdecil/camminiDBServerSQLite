@@ -1,0 +1,396 @@
+import { useEffect, useRef } from 'react'
+import { MapContainer, TileLayer, Polyline, Marker, useMap } from 'react-leaflet'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
+import { LAYERS, DEFAULT_LAYER } from './mapConfig'
+
+delete L.Icon.Default.prototype._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
+})
+
+const createIcon = (color, label = null, draggable = false) => {
+  const labelHtml = label ? `<span style="position: absolute; top: -22px; left: 50%; transform: translateX(-50%); background: ${color}; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px; white-space: nowrap; font-weight: bold; box-shadow: 0 1px 3px rgba(0,0,0,0.3);">${label}</span>` : ''
+  const cursorStyle = draggable ? 'cursor: grab;' : ''
+  return L.divIcon({
+    className: 'custom-marker',
+    html: `<div style="${cursorStyle} position: relative; background-color: ${color}; width: 30px; height: 30px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 6px rgba(0,0,0,0.4);">${labelHtml}</div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+  })
+}
+
+const startIcon = createIcon('#2ecc71')
+const endIcon = createIcon('#e74c3c')
+
+function MapController({ bounds }) {
+  const map = useMap()
+  useEffect(() => {
+    if (bounds) {
+      map.fitBounds(bounds, { padding: [50, 50] })
+    }
+  }, [bounds, map])
+  return null
+}
+
+function MapInstance({ mapRef }) {
+  const map = useMap()
+  useEffect(() => {
+    if (mapRef) {
+      mapRef.current = map
+    }
+  }, [map, mapRef])
+  return null
+}
+
+function MapEvents({ onMapClick, dragSelectedPhoto, onPhotoDrop, onHoverIndex, onHoverData, routeCoordinates, elevationData, showElevationTooltip = true, onMapMove }) {
+  const map = useMap()
+  const tooltipRef = useRef(null)
+  const fetchTimerRef = useRef(null)
+  const abortControllerRef = useRef(null)
+  const lastMouseLatLng = useRef(null)
+
+  useEffect(() => {
+    // Invia la posizione iniziale della mappa al mount
+    if (onMapMove) {
+      const center = map.getCenter()
+      const zoom = map.getZoom()
+      onMapMove([center.lat, center.lng], zoom)
+    }
+
+    const hideTooltip = () => {
+      if (tooltipRef.current) {
+        map.removeLayer(tooltipRef.current)
+        tooltipRef.current = null
+      }
+    }
+
+    const showTooltip = (latlng, text) => {
+      if (!showElevationTooltip) return
+      const tooltipContent = `<div style="padding: 6px 10px; background: rgba(0,0,0,0.75); color: #fff; border-radius: 6px; font-size: 12px; white-space: nowrap;">${text}</div>`
+      if (!tooltipRef.current) {
+        tooltipRef.current = L.tooltip({ permanent: false, direction: 'top', className: 'map-hover-tooltip', offset: [0, -12] })
+        tooltipRef.current.setLatLng(latlng).setContent(tooltipContent).addTo(map)
+      } else {
+        tooltipRef.current.setLatLng(latlng).setContent(tooltipContent)
+      }
+    }
+
+    const abortPendingFetch = () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+        abortControllerRef.current = null
+      }
+    }
+
+    const fetchElevationAt = async (latlng) => {
+      abortPendingFetch()
+      const controller = new AbortController()
+      abortControllerRef.current = controller
+
+      try {
+        const response = await fetch('/api/elevation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ locations: [{ lat: latlng.lat, lng: latlng.lng }] }),
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          throw new Error(`Elevation API ${response.status}`)
+        }
+
+        const data = await response.json()
+        const elevation = data?.results?.[0]?.elevation
+        const text = typeof elevation === 'number' ? `Altitudine: ${Math.round(elevation * 100) / 100} m` : 'Altitudine non disponibile'
+        if (lastMouseLatLng.current) {
+          showTooltip(lastMouseLatLng.current, text)
+        }
+      } catch (error) {
+        if (error.name === 'AbortError') return
+        console.warn('Elevation fetch failed:', error)
+        if (lastMouseLatLng.current) {
+          showTooltip(lastMouseLatLng.current, 'Altitudine non disponibile')
+        }
+      } finally {
+        abortControllerRef.current = null
+      }
+    }
+
+    const scheduleElevationFetch = (latlng) => {
+      lastMouseLatLng.current = latlng
+      if (fetchTimerRef.current) {
+        clearTimeout(fetchTimerRef.current)
+      }
+      showTooltip(latlng, 'Calcolo quota...')
+      fetchTimerRef.current = setTimeout(() => {
+        fetchTimerRef.current = null
+        fetchElevationAt(latlng)
+      }, 220)
+    }
+
+    const handleClick = (e) => {
+      if (dragSelectedPhoto && onPhotoDrop) {
+        onPhotoDrop(e.latlng.lat, e.latlng.lng)
+      } else if (onMapClick) {
+        onMapClick(e)
+      }
+    }
+
+    const handleMouseMove = (e) => {
+      const mouseLat = e.latlng.lat
+      const mouseLng = e.latlng.lng
+      if (routeCoordinates && routeCoordinates.length > 0 && onHoverIndex) {
+        let closestIndex = 0
+        let minDistance = Infinity
+        for (let i = 0; i < routeCoordinates.length; i++) {
+          const coord = routeCoordinates[i]
+          const distance = Math.sqrt(Math.pow(coord[0] - mouseLat, 2) + Math.pow(coord[1] - mouseLng, 2))
+          if (distance < minDistance) {
+            minDistance = distance
+            closestIndex = i
+          }
+        }
+        onHoverIndex(closestIndex)
+      }
+      scheduleElevationFetch(e.latlng)
+    }
+
+    const handleMouseOut = () => {
+      if (fetchTimerRef.current) {
+        clearTimeout(fetchTimerRef.current)
+        fetchTimerRef.current = null
+      }
+      abortPendingFetch()
+      hideTooltip()
+    }
+
+    const handleMoveEnd = () => {
+      if (onMapMove) {
+        const center = map.getCenter()
+        const zoom = map.getZoom()
+        onMapMove([center.lat, center.lng], zoom)
+      }
+    }
+
+    map.on('click', handleClick)
+    map.on('mousemove', handleMouseMove)
+    map.on('mouseout', handleMouseOut)
+    map.on('moveend', handleMoveEnd)
+    return () => {
+      if (fetchTimerRef.current) {
+        clearTimeout(fetchTimerRef.current)
+        fetchTimerRef.current = null
+      }
+      abortPendingFetch()
+      hideTooltip()
+      map.off('click', handleClick)
+      map.off('mousemove', handleMouseMove)
+      map.off('mouseout', handleMouseOut)
+      map.off('moveend', handleMoveEnd)
+    }
+  }, [map, onMapClick, dragSelectedPhoto, onPhotoDrop, onHoverIndex, routeCoordinates, showElevationTooltip, onMapMove])
+  return null
+}
+
+function MarkersLayer({ markers, onMarkerClick }) {
+  const map = useMap()
+  const markersRef = useRef({})
+  useEffect(() => {
+    Object.values(markersRef.current).forEach(marker => { if (marker) marker.remove() })
+    markersRef.current = {}
+    if (!markers || markers.length === 0) return
+    markers.forEach((markerData, index) => {
+      const color = markerData.type === 'track' ? '#3498db' : '#e74c3c'
+      const icon = L.divIcon({
+        className: 'home-marker',
+        html: `<div style="position: relative; background-color: ${color}; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 1px 3px rgba(0,0,0,0.4);"></div>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
+      })
+      const marker = L.marker(markerData.position, { icon, interactive: true })
+      if (onMarkerClick) {
+        marker.on('click', () => {
+          console.log('Marker click detected:', markerData)
+          onMarkerClick(markerData)
+        })
+      }
+      marker.bindTooltip(markerData.name, { permanent: true, direction: 'top', className: 'home-marker-tooltip', offset: [0, -14] })
+      marker.addTo(map)
+      const el = marker.getElement()
+      if (el) el.style.cursor = 'pointer'
+      markersRef.current[index] = marker
+    })
+    return () => { Object.values(markersRef.current).forEach(marker => { if (marker) marker.remove() }) }
+  }, [markers, map, onMarkerClick])
+  return null
+}
+
+function DraggableWaypoints({ waypoints, onWaypointDragEnd, draggable = true }) {
+  const map = useMap()
+  const markersRef = useRef({})
+  const draggingRef = useRef(null)
+
+  useEffect(() => {
+    // Don't recreate markers if one is being dragged
+    if (draggingRef.current) return
+
+    // Remove all existing markers first
+    Object.values(markersRef.current).forEach(marker => {
+      if (marker) marker.remove()
+    })
+    markersRef.current = {}
+    
+    // Recreate all markers with current waypoints data
+    waypoints.forEach((wp, index) => {
+      const icon = createIcon(wp.color, wp.label, draggable)
+      const marker = L.marker(wp.position, { icon, draggable })
+      if (draggable) {
+        marker.on('dragstart', function() {
+          draggingRef.current = marker
+          if (marker.getElement()) marker.getElement().style.cursor = 'grabbing'
+        })
+        marker.on('dragend', function(e) {
+          draggingRef.current = null
+          if (marker.getElement()) marker.getElement().style.cursor = 'grab'
+          if (onWaypointDragEnd) onWaypointDragEnd(index, e.target.getLatLng().lat, e.target.getLatLng().lng)
+        })
+        marker.on('drag', function() {
+          if (marker.getElement()) marker.getElement().style.cursor = 'grabbing'
+        })
+        marker.on('mouseover', function() {
+          if (marker.getElement()) marker.getElement().style.cursor = 'grab'
+        })
+      }
+      marker.addTo(map)
+      markersRef.current[index] = marker
+    })
+
+  }, [waypoints, map, onWaypointDragEnd, draggable])
+
+  // Separate effect for component unmount cleanup only
+  useEffect(() => {
+    return () => {
+      draggingRef.current = null
+      Object.values(markersRef.current).forEach(marker => {
+        if (marker) marker.remove()
+      })
+      markersRef.current = {}
+    }
+  }, [])
+
+  return null
+}
+
+function SelectedPointMarker({ coordinates, selectedIndex }) {
+  const map = useMap()
+  const markerRef = useRef(null)
+  useEffect(() => {
+    if (coordinates.length === 0 || selectedIndex === null) return
+    const index = Math.floor(selectedIndex * (coordinates.length - 1))
+    const clampedIndex = Math.max(0, Math.min(index, coordinates.length - 1))
+    const position = coordinates[clampedIndex]
+    if (markerRef.current) markerRef.current.remove()
+    const icon = L.divIcon({
+      className: 'selected-point-marker',
+      html: `<div style="background-color: #ff9800; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.5);"></div>`,
+      iconSize: [16, 16],
+      iconAnchor: [8, 8]
+    })
+    const marker = L.marker(position, { icon, interactive: false })
+    marker.addTo(map)
+    markerRef.current = marker
+    return () => { if (markerRef.current) { markerRef.current.remove(); markerRef.current = null } }
+  }, [coordinates, selectedIndex, map])
+  return null
+}
+
+// Component for GPS-tagged photo markers
+function PhotoMarkersLayer({ photoMarkers, itemId, onPhotoDrop, onPhotoClick }) {
+  const map = useMap()
+  const markersRef = useRef([])
+  useEffect(() => {
+    markersRef.current.forEach(marker => { if (marker) marker.remove() })
+    markersRef.current = []
+    if (!photoMarkers || photoMarkers.length === 0) return
+    photoMarkers.forEach((pm, index) => {
+      const icon = L.divIcon({
+        className: 'photo-marker',
+        html: `<div style="position: relative; display: flex; flex-direction: column; align-items: center;"><span style="font-size: 10px; background: rgba(255,255,255,0.9); padding: 1px 4px; border-radius: 3px; box-shadow: 0 1px 2px rgba(0,0,0,0.2);">📷${index + 1}</span></div>`,
+        iconSize: [30, 30],
+        iconAnchor: [15, 15],
+      })
+      const marker = L.marker(pm.position, { icon, draggable: true })
+      const rawPhotoPath = pm.photo.path ? decodeURIComponent(pm.photo.path) : ''
+      const photoUrl = pm.photo.url || `/api/photos/${encodeURIComponent(rawPhotoPath)}`
+      marker.bindPopup(`<div style="max-width: 200px; text-align: center;"><img src="${photoUrl}" alt="${pm.photo.name}" style="max-width: 100%; border-radius: 4px;" /><p style="margin: 5px 0 0 0; font-size: 11px; color: #666;">${pm.photo.name}</p></div>`)
+      marker.on('click', () => {
+        if (onPhotoClick) onPhotoClick(pm.photo.path)
+      })
+      marker.on('dragend', async function(e) {
+        const newLatLng = e.target.getLatLng()
+        if (onPhotoDrop) {
+          onPhotoDrop(newLatLng.lat, newLatLng.lng, pm.photo.path)
+        }
+      })
+      marker.addTo(map)
+      markersRef.current.push(marker)
+    })
+    return () => { markersRef.current.forEach(marker => { if (marker) marker.remove() }) }
+  }, [photoMarkers, map, itemId, onPhotoDrop, onPhotoClick])
+  return null
+}
+
+export default function Map({ 
+  trackCoordinates = [], startMarker = null, endMarker = null, routeCoordinates = [],
+  center = [41.9029, 12.4964], zoom = 13, onMapClick = null, currentLayer = 'OpenStreetMap',
+  waypoints = [], onWaypointDragEnd = null, draggable = true, selectedIndex = null,
+  onHover = null, onHoverData = null, elevationData = null, markers = [], onMarkerClick = null, onPhotoClick = null, multipleTracks = [],
+  hoverTrack = null, poiMarker = null, photoMarkers = [], showHikingOverlay = false, showElevationTooltip = true,
+  dragSelectedPhoto = null, onPhotoDrop = null, itemId = null, autoFitBounds = true,
+  onMapMove = null, mapRef = null
+}) {
+  const multiTrackCoords = multipleTracks.flatMap(t => t.coordinates)
+  const allCoords = multiTrackCoords.length > 0 ? [...multiTrackCoords, ...trackCoordinates, ...routeCoordinates] : [...trackCoordinates, ...routeCoordinates]
+  const waypointPositions = waypoints.map(wp => wp.position)
+  const bounds = allCoords.length > 0 || waypointPositions.length > 0 ? L.latLngBounds([...allCoords, ...waypointPositions]) : null
+  const layer = LAYERS[currentLayer] || LAYERS[DEFAULT_LAYER]
+
+  return (
+    <div className="map-wrapper">
+      <MapContainer center={center} zoom={zoom} style={{ height: '100%', width: '100%' }}>
+        <TileLayer attribution={layer.attribution} url={layer.url} />
+        {showHikingOverlay && (
+          <TileLayer 
+            url="https://tile.waymarkedtrails.org/hiking/{z}/{x}/{y}.png"
+            attribution='&copy; <a href="https://waymarkedtrails.org">Waymarked Trails</a>'
+            zIndex={10}
+            opacity={0.7}
+          />
+        )}
+        {markers.length > 0 && <MarkersLayer markers={markers} onMarkerClick={onMarkerClick} />}
+        {multipleTracks.length > 0 && multipleTracks.map((track, index) => (
+          track.coordinates.length > 0 && <Polyline key={index} positions={track.coordinates} color={track.color || '#3498db'} weight={4} opacity={0.8} />
+        ))}
+        {trackCoordinates.length > 0 && multipleTracks.length === 0 && <Polyline positions={trackCoordinates} color="#3498db" weight={4} opacity={0.8} />}
+        {routeCoordinates.length > 0 && <Polyline positions={routeCoordinates} color="#e74c3c" weight={5} opacity={0.8} />}
+        {waypoints.length > 0 && <DraggableWaypoints waypoints={waypoints} onWaypointDragEnd={onWaypointDragEnd} draggable={draggable && !!onWaypointDragEnd} />}
+        {startMarker && <Marker position={startMarker} icon={startIcon} />}
+        {endMarker && <Marker position={endMarker} icon={endIcon} />}
+        <MapInstance mapRef={mapRef} />
+        {bounds && autoFitBounds && <MapController bounds={bounds} />}
+        <MapEvents onMapClick={onMapClick} dragSelectedPhoto={dragSelectedPhoto} onPhotoDrop={onPhotoDrop} onHoverIndex={onHover} onHoverData={onHoverData} routeCoordinates={routeCoordinates.length > 0 ? routeCoordinates : trackCoordinates} elevationData={elevationData} showElevationTooltip={showElevationTooltip} onMapMove={onMapMove} />
+        {selectedIndex !== null && (routeCoordinates.length > 0 || trackCoordinates.length > 0) && <SelectedPointMarker coordinates={routeCoordinates.length > 0 ? routeCoordinates : trackCoordinates} selectedIndex={selectedIndex} />}
+        {hoverTrack && hoverTrack.coordinates && hoverTrack.coordinates.length > 0 && hoverTrack.index !== null && (
+          <Marker position={hoverTrack.coordinates[Math.floor(hoverTrack.index * (hoverTrack.coordinates.length - 1))]} icon={L.divIcon({ className: 'loaded-track-hover-marker', html: `<div style="background-color: ${hoverTrack.color || '#ff9800'}; width: 14px; height: 14px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.5);"></div>`, iconSize: [14, 14], iconAnchor: [7, 7] })} interactive={false} zIndexOffset={1000} />
+        )}
+        {photoMarkers.length > 0 && <PhotoMarkersLayer photoMarkers={photoMarkers} itemId={itemId} onPhotoDrop={onPhotoDrop} onPhotoClick={onPhotoClick} />}
+        {poiMarker && poiMarker.position && (
+          <Marker position={poiMarker.position} icon={L.divIcon({ className: 'poi-marker', html: `<div style="display: flex; flex-direction: column; align-items: center;"><span style="background: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; box-shadow: 0 1px 3px rgba(0,0,0,0.3); font-weight: bold;">${poiMarker.icon} ${poiMarker.name}</span><div style="font-size: 24px; margin-top: -2px; filter: drop-shadow(0 2px 3px rgba(0,0,0,0.4));">📍</div></div>`, iconSize: [40, 40], iconAnchor: [20, 40] })} />
+        )}
+      </MapContainer>
+    </div>
+  )
+}
